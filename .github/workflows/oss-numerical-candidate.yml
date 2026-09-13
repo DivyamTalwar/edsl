@@ -1,0 +1,116 @@
+name: Fork-only numerical fix validation
+
+on:
+  push:
+    branches: [audit/verify-numerical-repair-2627]
+    paths:
+      - .audit/numerical-repair.patch
+      - .github/workflows/oss-numerical-candidate.yml
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    if: github.repository == 'DivyamTalwar/edsl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Apply candidate to the pinned upstream baseline
+        run: |
+          set -euo pipefail
+          cp .audit/numerical-repair.patch "$RUNNER_TEMP/input.patch"
+          git fetch --depth=1 origin 476cedd7ac958d042118b959490a332faa12cab1
+          git checkout --detach 476cedd7ac958d042118b959490a332faa12cab1
+          git apply --check "$RUNNER_TEMP/input.patch"
+          git apply "$RUNNER_TEMP/input.patch"
+          mkdir "$RUNNER_TEMP/evidence"
+      - name: Install offline test and formatting dependencies
+        run: python -m pip install -e . pytest==7.4.3 pytest-socket pytest-mock sqlalchemy black==23.10.1 ruff==0.3.7
+      - name: Normalize only the two changed Python files
+        run: |
+          python -m black edsl/questions/question_numerical.py tests/questions/test_numerical_response_repair.py
+          cp edsl/questions/question_numerical.py "$RUNNER_TEMP/fixed-numerical.py"
+      - name: Require regression failures on the original implementation
+        run: |
+          set -euo pipefail
+          git restore --source=HEAD edsl/questions/question_numerical.py
+          set +e
+          python -m pytest --noconftest -p no:cacheprovider --disable-socket -q tests/questions/test_numerical_response_repair.py --junitxml="$RUNNER_TEMP/evidence/baseline.xml" > "$RUNNER_TEMP/evidence/baseline.txt" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/evidence/baseline.txt"
+          test "$result" -eq 1
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = ET.parse(Path(os.environ['RUNNER_TEMP']) / 'evidence/baseline.xml').getroot()
+          suites = list(root.iter('testsuite'))
+          assert sum(int(s.get('failures', 0)) for s in suites) > 0
+          assert sum(int(s.get('errors', 0)) for s in suites) == 0
+          print('Regression sensitivity confirmed on the original repository implementation.')
+          PY
+          cp "$RUNNER_TEMP/fixed-numerical.py" edsl/questions/question_numerical.py
+      - name: Run candidate regressions, existing validator tests, and numerical doctests
+        run: |
+          set -euo pipefail
+          python -m pytest --noconftest -p no:cacheprovider --disable-socket -q tests/questions/test_numerical_response_repair.py tests/questions/test_QuestionNumerical.py tests/questions/test_ResponseValidator.py --doctest-modules edsl/questions/question_numerical.py --junitxml="$RUNNER_TEMP/evidence/candidate.xml" | tee "$RUNNER_TEMP/evidence/candidate.txt"
+          python -m black --check edsl/questions/question_numerical.py tests/questions/test_numerical_response_repair.py
+          python -m ruff check edsl/questions/question_numerical.py tests/questions/test_numerical_response_repair.py
+          git add edsl/questions/question_numerical.py tests/questions/test_numerical_response_repair.py
+          git diff --cached --check
+      - name: Seal the exact tested change
+        run: |
+          set -euo pipefail
+          test "$(git diff --cached --name-only | sort)" = "$(printf '%s\n' edsl/questions/question_numerical.py tests/questions/test_numerical_response_repair.py | sort)"
+          git diff --cached --binary > "$RUNNER_TEMP/evidence/candidate.patch"
+          git write-tree > "$RUNNER_TEMP/evidence/tested-tree.txt"
+          printf '%s\n' 476cedd7ac958d042118b959490a332faa12cab1 > "$RUNNER_TEMP/evidence/baseline-commit.txt"
+          python -m pip freeze > "$RUNNER_TEMP/evidence/dependencies.txt"
+          sha256sum edsl/questions/question_numerical.py tests/questions/test_numerical_response_repair.py > "$RUNNER_TEMP/evidence/SHA256SUMS"
+      - name: Upload actual test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: numerical-candidate-evidence
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-feature-branch:
+    needs: validate
+    if: github.repository == 'DivyamTalwar/edsl'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 476cedd7ac958d042118b959490a332faa12cab1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: numerical-candidate-evidence
+          path: ${{ runner.temp }}/validated
+      - name: Publish only the tested patch, never main or an upstream repository
+        run: |
+          set -euo pipefail
+          test "$(cat "$RUNNER_TEMP/validated/baseline-commit.txt")" = "$(git rev-parse HEAD)"
+          git apply --index "$RUNNER_TEMP/validated/candidate.patch"
+          test "$(git write-tree)" = "$(cat "$RUNNER_TEMP/validated/tested-tree.txt")"
+          sha256sum -c "$RUNNER_TEMP/validated/SHA256SUMS"
+          test "$(git diff --cached --name-only | sort)" = "$(printf '%s\n' edsl/questions/question_numerical.py tests/questions/test_numerical_response_repair.py | sort)"
+          git -c user.name='Divyam Talwar' -c user.email='194859478+DivyamTalwar@users.noreply.github.com' commit -m 'fix(questions): reject ambiguous numerical answer repairs'
+          git push origin HEAD:refs/heads/fix/numerical-answer-repair-2627
+          git rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
