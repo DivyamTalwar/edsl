@@ -192,40 +192,56 @@ class NumericalResponseValidator(ResponseValidatorABC):
     ]
 
     def fix(self, response, verbose=False):
+        """Recover one unambiguous numerical answer without inspecting metadata.
+
+        Preserve non-string answers. For text answers, accept exactly one complete
+        numerical token, including signs, scientific notation, and well-formed
+        thousands separators. Multiple tokens are ambiguous even when only one is
+        in range; leave those responses unchanged so normal validation reports the
+        original error rather than silently selecting an intermediate value.
+
+        ``generated_tokens`` is used only when ``answer`` is missing or ``None``.
+        Comments and raw generated tokens are retained, and the input is not mutated.
+        Recovered candidates must satisfy the existing response model.
         """
-        Fix common issues in numerical responses.
+        fixed = dict(response)
+        answer = response.get("answer")
+        if answer is None:
+            answer = response.get("generated_tokens")
+        if not isinstance(answer, str):
+            return fixed
 
-        This method attempts to extract valid numbers from text responses,
-        handle formatting issues, and ensure the response contains a valid number.
+        # Capture comma-containing tokens before validating their grouping: removing
+        # every comma up front would turn an ambiguous "1,2" into the number 12.
+        token_pattern = (
+            r"(?<![\w.+−-])[+-]?"
+            r"(?:\d(?:[\d,]*\d)?(?:\.\d*)?|\.\d+)"
+            r"(?:[eE][+-]?\d+)?(?![\w+−-]|\.\w)"
+        )
+        tokens = list(re.finditer(token_pattern, answer))
+        if len(tokens) != 1:
+            return fixed
+        match = tokens[0]
+        outside_token = answer[: match.start()] + answer[match.end() :]
+        if any(character.isdecimal() for character in outside_token):
+            return fixed
 
-        Args:
-            response: The response dictionary to fix.
-            verbose: If True, print information about the fixing process.
+        number_pattern = (
+            r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)" r"(?:[eE][+-]?\d+)?"
+        )
+        token = match.group(0)
+        if re.fullmatch(number_pattern, token) is None:
+            return fixed
 
-        Returns:
-            A fixed version of the response dictionary.
-
-        Notes:
-            - Attempts to extract numbers using regex pattern matching
-            - Removes commas from numbers (e.g., "1,000" → "1000")
-            - Preserves any comment in the original response
-        """
-        response_text = str(response).lower()
+        candidate = dict(response, answer=token.replace(",", ""))
+        try:
+            self.response_model.model_validate(candidate)
+        except (ValidationError, QuestionAnswerValidationError):
+            return fixed
 
         if verbose:
-            print(f"Invalid generated tokens was: {response_text}")
-
-        pattern = r"\b\d+(?:\.\d+)?\b"
-        match = re.search(pattern, response_text.replace(",", ""))
-        solution = match.group(0) if match else response.get("answer")
-
-        if verbose:
-            print("Proposed solution is: ", solution)
-
-        if "comment" in response:
-            return {"answer": solution, "comment": response["comment"]}
-        else:
-            return {"answer": solution}
+            print("Proposed numerical answer is:", candidate["answer"])
+        return candidate
 
     def _check_constraints(self, pydantic_edsl_answer: BaseModel):
         """Method preserved for compatibility, constraints handled in Pydantic model."""

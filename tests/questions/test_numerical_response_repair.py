@@ -1,0 +1,161 @@
+"""Offline regression coverage for numerical-answer repair (issue #2627)."""
+
+from copy import deepcopy
+
+import pytest
+
+from edsl import QuestionNumerical
+from edsl.questions.exceptions import QuestionAnswerValidationError
+
+
+def question(**kwargs):
+    return QuestionNumerical(
+        question_name="number", question_text="Return one number.", **kwargs
+    )
+
+
+@pytest.mark.parametrize("value", [0, 1, 0.1667, -0.25, 1000, 1e-7])
+@pytest.mark.parametrize("metadata_first", [False, True])
+def test_structured_answer_wins_over_metadata(value, metadata_first):
+    metadata = {"comment": "Day 12 had 1 observation.", "generated_tokens": "99 then 2"}
+    response = (
+        dict(metadata, answer=value)
+        if metadata_first
+        else {"answer": value, **metadata}
+    )
+    original = deepcopy(response)
+    fixed = question().response_validator.fix(response)
+    assert fixed == response
+    assert fixed is not response
+    assert response == original
+    validated = question()._validate_answer(response)
+    assert validated["answer"] == value
+    assert validated["generated_tokens"] == response["generated_tokens"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I counted 1 observation on day 12. The final probability is 0.1667.",
+        "In 2024 the estimate was 0.1; now it is 0.1667.",
+        "The answer is 0.25 or 0.75.",
+        "The answer is 0.25. Confidence: 0.9.",
+        "0.25\n0.75",
+        "0.25 and 99",  # Do not choose the sole candidate that happens to be in range.
+        "1/2",
+        "1, 2",
+    ],
+)
+def test_ambiguous_text_is_not_silently_repaired(text):
+    response = {"answer": text, "generated_tokens": "Final answer: 0.1667"}
+    q = question(min_value=0, max_value=1)
+    assert q.response_validator.fix(response) == response
+    with pytest.raises(QuestionAnswerValidationError):
+        question(min_value=0, max_value=1)._validate_answer(response)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("42", 42),
+        ("The answer is 42", 42),
+        ("The answer is 42.", 42),
+        ("The answer is 42, exactly.", 42),
+        ("Final answer: 0", 0),
+        ("Final answer: 1", 1),
+        ("The temperature is -42", -42),
+        ("Value: +42", 42),
+        ("Value: -.5", -0.5),
+        ("Value: .5", 0.5),
+        ("Value: 1e-3", 0.001),
+        ("Value: -2.5E+2", -250),
+        ("Value: 1,234", 1234),
+        ("Value: -1,234.5", -1234.5),
+        ("Value: 1,234,567.89", 1234567.89),
+        ("Value: 1,234e-3", 1.234),
+    ],
+)
+def test_one_complete_numeric_token_is_recovered(text, expected):
+    response = {
+        "answer": text,
+        "comment": "An explanation with unrelated 12 and 99.",
+        "generated_tokens": "Raw provider output: 7 and 8.",
+    }
+    original = deepcopy(response)
+    validated = question()._validate_answer(response)
+    assert validated["answer"] == pytest.approx(expected)
+    assert validated["comment"] == response["comment"]
+    assert validated["generated_tokens"] == response["generated_tokens"]
+    assert response == original
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["1,2", "1,23", "1,,234", "1.2.3", "--2", "1e+", "−42", "v42"],
+)
+def test_malformed_tokens_are_not_partially_repaired(text):
+    response = {"answer": text}
+    assert question().response_validator.fix(response) == response
+    with pytest.raises(QuestionAnswerValidationError):
+        question()._validate_answer(response)
+
+
+@pytest.mark.parametrize("answer", [None, "MISSING"])
+def test_raw_tokens_are_a_documented_fallback_for_an_absent_answer(answer):
+    response = {"generated_tokens": "Final answer: -0.25", "comment": "day 12"}
+    if answer is None:
+        response["answer"] = None
+    original = deepcopy(response)
+    validated = question(min_value=-1, max_value=1)._validate_answer(response)
+    assert validated["answer"] == -0.25
+    assert validated["generated_tokens"] == original["generated_tokens"]
+    assert response == original
+
+
+@pytest.mark.parametrize("answer", ["", "not a number", "2", 2, [0.25]])
+def test_raw_tokens_do_not_replace_a_present_invalid_answer(answer):
+    response = {"answer": answer, "generated_tokens": "0.25", "comment": "0.5"}
+    with pytest.raises(QuestionAnswerValidationError):
+        question(min_value=0, max_value=1)._validate_answer(response)
+
+
+@pytest.mark.parametrize("text", ["Value: -0.1", "Value: 1.1", "Value: 2e2"])
+def test_recovered_candidates_still_obey_range_constraints(text):
+    response = {"answer": text, "generated_tokens": "0.25"}
+    assert (
+        question(min_value=0, max_value=1).response_validator.fix(response) == response
+    )
+    with pytest.raises(QuestionAnswerValidationError):
+        question(min_value=0, max_value=1)._validate_answer(response)
+
+
+def test_permissive_mode_keeps_its_existing_range_contract():
+    result = question(min_value=0, max_value=1, permissive=True)._validate_answer(
+        {"answer": "Value: -2.5"}
+    )
+    assert result["answer"] == -2.5
+
+
+def test_missing_answer_does_not_search_comment_or_structured_raw_tokens():
+    for response in [{"comment": "42"}, {"generated_tokens": {"count": 42}}]:
+        assert question().response_validator.fix(response) == response
+        with pytest.raises(QuestionAnswerValidationError):
+            question()._validate_answer(response)
+
+
+@pytest.mark.parametrize("first", ["0.25", "0", "1e-3"])
+@pytest.mark.parametrize("second", ["0.75", "1", "2e-3"])
+@pytest.mark.parametrize("suffix", [".", ",", ";", ")", ""])
+def test_punctuation_cannot_hide_a_second_candidate(first, second, suffix):
+    response = {"answer": f"Either {first} or {second}{suffix}"}
+    assert question().response_validator.fix(response) == response
+    with pytest.raises(QuestionAnswerValidationError):
+        question()._validate_answer(response)
+
+
+@pytest.mark.parametrize("text", ["v2 says 0.25", "1e+ then 0.25", "−2 then 0.25"])
+def test_unmatched_digits_prevent_partial_repair(text):
+    response = {"answer": text}
+    assert question().response_validator.fix(response) == response
+    with pytest.raises(QuestionAnswerValidationError):
+        question()._validate_answer(response)
