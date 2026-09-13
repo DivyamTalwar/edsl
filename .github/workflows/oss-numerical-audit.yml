@@ -1,0 +1,56 @@
+name: Fork-only numerical regression evidence
+
+on:
+  push:
+    branches: [audit/verify-numerical-repair-2627]
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    if: github.repository == 'DivyamTalwar/edsl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Archive the exact upstream baseline
+        run: |
+          mkdir evidence
+          git archive --format=zip --output=evidence/edsl-source.zip 476cedd7ac958d042118b959490a332faa12cab1
+          git rev-parse HEAD > evidence/workflow-commit.txt
+          sha256sum evidence/edsl-source.zip > evidence/source-sha256.txt
+      - name: Install public package and offline test dependencies
+        run: python -m pip install -e . pytest sqlalchemy
+      - name: Reproduce the numerical repair defect without provider calls
+        run: |
+          python - <<'PY' | tee evidence/baseline-reproduction.txt
+          import platform
+          import sys
+          from edsl import QuestionNumerical
+          q = QuestionNumerical(question_name='probability', question_text='Return one probability.', min_value=0, max_value=1)
+          response = {
+              'answer': 'I counted 1 observation on day 12. The final probability is 0.1667.',
+              'generated_tokens': 'I counted 1 observation on day 12.\nFinal answer: 0.1667',
+          }
+          fixed = q.response_validator.fix(response)
+          print('Python:', sys.version)
+          print('Platform:', platform.platform())
+          print('Input:', repr(response))
+          print('Actual repair:', repr(fixed))
+          assert fixed['answer'] == '1', 'The recorded baseline defect no longer reproduces; do not implement from the old report.'
+          print('BASELINE BUG REPRODUCED: the intermediate count was selected instead of the final probability.')
+          PY
+      - name: Upload source and execution evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edsl-numerical-baseline
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
