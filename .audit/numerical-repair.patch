@@ -1,6 +1,6 @@
 --- a/edsl/questions/question_numerical.py
 +++ b/edsl/questions/question_numerical.py
-@@ -192,40 +192,53 @@
+@@ -192,40 +192,57 @@
      ]
  
      def fix(self, response, verbose=False):
@@ -47,17 +47,21 @@
 +        token_pattern = (
 +            r"(?<![\w.+−-])[+-]?"
 +            r"(?:\d(?:[\d,]*\d)?(?:\.\d*)?|\.\d+)"
-+            r"(?:[eE][+-]?\d+)?(?![\w.+−-])"
++            r"(?:[eE][+-]?\d+)?(?![\w+−-]|\.\w)"
 +        )
-+        tokens = re.findall(token_pattern, answer)
++        tokens = list(re.finditer(token_pattern, answer))
 +        if len(tokens) != 1:
++            return fixed
++        match = tokens[0]
++        outside_token = answer[: match.start()] + answer[match.end() :]
++        if any(character.isdecimal() for character in outside_token):
 +            return fixed
 +
 +        number_pattern = (
 +            r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)"
 +            r"(?:[eE][+-]?\d+)?"
 +        )
-+        token = tokens[0]
++        token = match.group(0)
 +        if re.fullmatch(number_pattern, token) is None:
 +            return fixed
 +
@@ -88,7 +92,7 @@
          """Method preserved for compatibility, constraints handled in Pydantic model."""
 --- /dev/null
 +++ b/tests/questions/test_numerical_response_repair.py
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,159 @@
 +"""Offline regression coverage for numerical-answer repair (issue #2627)."""
 +
 +from copy import deepcopy
@@ -230,3 +234,21 @@
 +        assert question().response_validator.fix(response) == response
 +        with pytest.raises(QuestionAnswerValidationError):
 +            question()._validate_answer(response)
++
++
++@pytest.mark.parametrize("first", ["0.25", "0", "1e-3"])
++@pytest.mark.parametrize("second", ["0.75", "1", "2e-3"])
++@pytest.mark.parametrize("suffix", [".", ",", ";", ")", ""])
++def test_punctuation_cannot_hide_a_second_candidate(first, second, suffix):
++    response = {"answer": f"Either {first} or {second}{suffix}"}
++    assert question().response_validator.fix(response) == response
++    with pytest.raises(QuestionAnswerValidationError):
++        question()._validate_answer(response)
++
++
++@pytest.mark.parametrize("text", ["v2 says 0.25", "1e+ then 0.25", "−2 then 0.25"])
++def test_unmatched_digits_prevent_partial_repair(text):
++    response = {"answer": text}
++    assert question().response_validator.fix(response) == response
++    with pytest.raises(QuestionAnswerValidationError):
++        question()._validate_answer(response)
