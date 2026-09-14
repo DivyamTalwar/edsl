@@ -6,6 +6,7 @@ from anthropic import AsyncAnthropic
 from ..inference_service_abc import InferenceServiceABC
 from ..decorators import report_errors_async
 from .message_builder import MessageBuilder
+from ...language_models.exceptions import LanguageModelBadResponseError
 
 # Use TYPE_CHECKING to avoid circular imports at runtime
 if TYPE_CHECKING:
@@ -82,9 +83,7 @@ class AnthropicService(InferenceServiceABC):
         name = model_name.lower()
         if re.search(r"claude-(fable|mythos)", name):
             return True
-        version_match = re.search(
-            r"claude-(?:opus|sonnet|haiku)-(\d+)-(\d+)", name
-        )
+        version_match = re.search(r"claude-(?:opus|sonnet|haiku)-(\d+)-(\d+)", name)
         if version_match:
             version = (int(version_match.group(1)), int(version_match.group(2)))
             return version >= (4, 7)
@@ -179,9 +178,7 @@ class AnthropicService(InferenceServiceABC):
                         # Handle .docx by including their extracted text
                         elif msg_builder._is_docx_file(file_entry):
                             text_content = msg_builder.decode_docx_text(file_entry)
-                            filename = getattr(
-                                file_entry, "filename", "document.docx"
-                            )
+                            filename = getattr(file_entry, "filename", "document.docx")
                             messages[0]["content"].append(
                                 {
                                     "type": "text",
@@ -223,8 +220,6 @@ class AnthropicService(InferenceServiceABC):
                                     "text": f"[Unsupported file '{filename}' of type '{file_entry.mime_type}'. File content cannot be processed.]",
                                 }
                             )
-                client = AsyncAnthropic(api_key=self.api_token)
-
                 create_kwargs = dict(
                     model=model_name,
                     max_tokens=self.max_tokens,
@@ -241,9 +236,22 @@ class AnthropicService(InferenceServiceABC):
                 if self.output_config is not None:
                     create_kwargs["output_config"] = self.output_config
 
-                response = await client.messages.create(**create_kwargs)
-                response_model = response.model_dump()
-                return response_model
+                # Always stream internally: token-count thresholds depend on the
+                # SDK/model and can reject valid long requests before dispatch.
+                # The public EDSL contract remains one complete response dict.
+                async with AsyncAnthropic(api_key=self.api_token) as client:
+                    async with client.messages.stream(**create_kwargs) as stream:
+                        completed = False
+                        async for event in stream:
+                            if event.type == "message_stop":
+                                completed = True
+                        if not completed:
+                            raise LanguageModelBadResponseError(
+                                "Anthropic stream ended before message_stop. "
+                                "The partial response cannot be treated as complete."
+                            )
+                        response = await stream.get_final_message()
+                        return response.model_dump()
 
         LLM.__name__ = model_class_name
 

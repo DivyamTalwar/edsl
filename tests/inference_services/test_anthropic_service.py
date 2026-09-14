@@ -1,12 +1,11 @@
 import asyncio
+from types import SimpleNamespace
 
 from edsl.inference_services.services.anthropic_service import AnthropicService
 
 
 def test_requires_temperature_one_for_models_after_opus_46():
-    assert AnthropicService._requires_temperature_one(
-        "claude-sonnet-4-6-20260217"
-    )
+    assert AnthropicService._requires_temperature_one("claude-sonnet-4-6-20260217")
     assert AnthropicService._requires_temperature_one("claude-opus-4-7-20260416")
     assert AnthropicService._requires_temperature_one("claude-opus-4-7")
     assert AnthropicService._requires_temperature_one("claude-sonnet-4-6")
@@ -25,14 +24,33 @@ def test_anthropic_request_uses_temperature_one_for_affected_models(monkeypatch)
         def model_dump(self):
             return {"content": [{"type": "text", "text": "ok"}]}
 
-    class DummyMessages:
-        async def create(self, **kwargs):
-            captured_kwargs.update(kwargs)
+    class DummyStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def __aiter__(self):
+            yield SimpleNamespace(type="message_stop")
+
+        async def get_final_message(self):
             return DummyResponse()
+
+    class DummyMessages:
+        def stream(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyStream()
 
     class DummyAnthropicClient:
         def __init__(self, api_key):
             self.messages = DummyMessages()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
 
     monkeypatch.setattr(
         "edsl.inference_services.services.anthropic_service.AsyncAnthropic",
@@ -75,14 +93,33 @@ def test_anthropic_request_omits_temperature_for_fable(monkeypatch):
         def model_dump(self):
             return {"content": [{"type": "text", "text": "ok"}]}
 
-    class DummyMessages:
-        async def create(self, **kwargs):
-            captured_kwargs.update(kwargs)
+    class DummyStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def __aiter__(self):
+            yield SimpleNamespace(type="message_stop")
+
+        async def get_final_message(self):
             return DummyResponse()
+
+    class DummyMessages:
+        def stream(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyStream()
 
     class DummyAnthropicClient:
         def __init__(self, api_key):
             self.messages = DummyMessages()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
 
     monkeypatch.setattr(
         "edsl.inference_services.services.anthropic_service.AsyncAnthropic",
@@ -106,14 +143,33 @@ def test_anthropic_request_preserves_temperature_for_legacy_models(monkeypatch):
         def model_dump(self):
             return {"content": [{"type": "text", "text": "ok"}]}
 
-    class DummyMessages:
-        async def create(self, **kwargs):
-            captured_kwargs.update(kwargs)
+    class DummyStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def __aiter__(self):
+            yield SimpleNamespace(type="message_stop")
+
+        async def get_final_message(self):
             return DummyResponse()
+
+    class DummyMessages:
+        def stream(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyStream()
 
     class DummyAnthropicClient:
         def __init__(self, api_key):
             self.messages = DummyMessages()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
 
     monkeypatch.setattr(
         "edsl.inference_services.services.anthropic_service.AsyncAnthropic",

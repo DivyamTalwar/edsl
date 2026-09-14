@@ -112,6 +112,41 @@ Output:
 | parameters:top_logprobs | 3 |
 | inference_service | openai |
 
+## Anthropic streaming and long requests
+
+The Anthropic adapter uses the SDK streaming transport for every request, including
+short requests, and assembles the final message internally. Callers still await one
+response dictionary; they do not need to consume a stream. The adapter forwards the
+configured `max_tokens`, `thinking`, and `output_config` without reducing them to
+avoid nonstreaming SDK limits. Existing model-specific temperature handling is
+unchanged.
+
+The final dictionary retains the provider's content blocks, signatures, response
+identifier, stop reason, and usage. Both the stream and its request-owned client
+are closed on completion, error, timeout, or cancellation. If the transport ends
+before the terminal `message_stop` event, the adapter raises an error rather than
+returning or caching a partial message as a completed call. A final message with
+`stop_reason="max_tokens"` is different: its transport completed, but its output
+budget was exhausted. Inspect the raw stop reason before treating that answer as
+complete.
+
+Streaming does not disable EDSL's total-call timeout. The normal cached inference
+path still uses `EDSL_API_TIMEOUT` (60 seconds by default, with the existing
+file-related adjustment). Set a finite timeout appropriate to the workload in the
+process that executes the call, before importing EDSL. For example, a local process
+can be started with a twenty-minute base timeout:
+
+```bash
+EDSL_API_TIMEOUT=1200 python run_local_survey.py
+```
+
+This environment setting is not a serialized `Model` parameter. For remote
+inference, the worker's EDSL version, environment, and service/task deadlines must
+be configured and verified separately. Calling the low-level adapter method
+directly does not apply the outer EDSL cached-call deadline. The adapter does not
+add a retry around partially consumed streams or automatically increase a token
+budget; SDK and higher-level retry policies remain separate.
+
 ## Creating a list of models
 
 To create a list of models at once, pass a list of model names to a ModelList object.
