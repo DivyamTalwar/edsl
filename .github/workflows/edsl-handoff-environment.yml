@@ -1,0 +1,49 @@
+name: Fork-only EDSL handoff environment
+
+on:
+  push:
+    branches: [audit/edsl-developer-handoff-20260914]
+    paths: [.github/workflows/edsl-handoff-environment.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  environment:
+    if: github.repository == 'DivyamTalwar/edsl'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 9d186ffaddb3d567e005c4de6ce16d172a7ea703
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - name: Capture the exact upstream source
+        run: |
+          mkdir -p handoff-environment/wheels
+          git rev-parse HEAD > handoff-environment/source-commit.txt
+          git rev-parse HEAD^{tree} > handoff-environment/source-tree.txt
+          git archive --format=zip --output=handoff-environment/source.zip HEAD
+          python --version > handoff-environment/python.txt
+      - name: Build offline dependencies without provider requests
+        run: |
+          python -m pip wheel --wheel-dir handoff-environment/wheels . \
+            'anthropic==0.80.0' 'openai==2.44.0' sqlalchemy \
+            'pytest==7.4.4' 'pytest-asyncio==0.23.8' 'pytest-socket==0.7.0' \
+            'pytest-env==1.1.3' 'black==23.10.1' 'ruff==0.3.7' \
+            > handoff-environment/build.log 2>&1
+      - name: Record integrity
+        run: |
+          cd handoff-environment
+          sha256sum source.zip wheels/* > SHA256SUMS
+      - name: Upload source and offline dependency wheels
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: edsl-handoff-environment
+          path: handoff-environment/
+          if-no-files-found: error
+          retention-days: 7
