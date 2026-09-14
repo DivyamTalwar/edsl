@@ -1,0 +1,192 @@
+diff --git a/internal/api/v2/controllers_schema_insert.go b/internal/api/v2/controllers_schema_insert.go
+index b6c8695..cf3cb45 100644
+--- a/internal/api/v2/controllers_schema_insert.go
++++ b/internal/api/v2/controllers_schema_insert.go
+@@ -15,8 +15,20 @@ import (
+ )
+ 
+ func insertSchema(w http.ResponseWriter, r *http.Request) {
++	var payload json.RawMessage
++	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
++		api.BadRequest(w, common.ErrValidation, err)
++		return
++	}
++
+ 	data := ledger.SchemaData{}
+-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
++	if err := json.Unmarshal(payload, &data); err != nil {
++		api.BadRequest(w, common.ErrValidation, err)
++		return
++	}
++	// Check the raw submitted bytes rather than the decoded chart, whose
++	// codec discards unknown properties. Keep the general codec permissive for persisted legacy charts.
++	if err := validateSchemaChartProperties(payload); err != nil {
+ 		api.BadRequest(w, common.ErrValidation, err)
+ 		return
+ 	}
+diff --git a/internal/api/v2/controllers_schema_properties_test.go b/internal/api/v2/controllers_schema_properties_test.go
+new file mode 100644
+index 0000000..90e0962
+--- /dev/null
++++ b/internal/api/v2/controllers_schema_properties_test.go
+@@ -0,0 +1,86 @@
++package v2
++
++import (
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++
++	"github.com/formancehq/go-libs/v5/pkg/authn/jwt"
++	"github.com/formancehq/go-libs/v5/pkg/transport/api"
++	ledger "github.com/formancehq/ledger/internal"
++)
++
++func TestInsertSchemaRejectsUnknownChartProperties(t *testing.T) {
++	t.Parallel()
++	cases := []struct {
++		name, chart, key, path string
++	}{
++		{"pattern typo", `{"bank":{".patern":"^[A-Z]+$"}}`, ".patern", "bank"},
++		{"rules typo", `{"bank":{".rulez":{}}}`, ".rulez", "bank"},
++		{"metadata typo", `{"bank":{".metadatas":{"x":{"default":"y"}}}}`, ".metadatas", "bank"},
++		{"unknown array", `{"bank":{".anything-at-all":[1,2,3]}}`, ".anything-at-all", "bank"},
++		{"unknown null", `{"bank":{".forbiden":null}}`, ".forbiden", "bank"},
++		{"nested fixed", `{"bank":{"cash":{".rulez":{}}}}`, ".rulez", "bank:cash"},
++		{"nested variable", `{"bank":{"$id":{".pattern":"^[A-Z]+$",".patern":"x"}}}`, ".patern", "bank:$id"},
++		{"non-leaf", `{"bank":{".patern":"x","child":{}}}`, ".patern", "bank"},
++		{"deterministic diagnostic", `{"bank":{".zzz":{},".aaa":{}}}`, ".aaa", "bank"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			systemController, _ := newTestingSystemController(t, true)
++			// No InsertSchema expectation: a call would fail this test before any write.
++			router := NewRouter(systemController, jwt.NewNoAuth(), "develop")
++			req := httptest.NewRequest(http.MethodPost, "/default/schemas/v1", bytes.NewBufferString(`{"chart":`+tc.chart+`}`))
++			rec := httptest.NewRecorder()
++			router.ServeHTTP(rec, req)
++			require.Equal(t, http.StatusBadRequest, rec.Code)
++			var response api.ErrorResponse
++			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
++			require.Equal(t, "VALIDATION", response.ErrorCode)
++			require.Contains(t, rec.Body.String(), tc.key)
++			require.Contains(t, rec.Body.String(), tc.path)
++		})
++	}
++}
++
++func TestInsertSchemaKnownChartPropertiesRemainAccepted(t *testing.T) {
++	t.Parallel()
++	for name, chart := range map[string]string{
++		"leaf":               `{"bank":{}}`,
++		"self":               `{"bank":{".self":{},"cash":{}}}`,
++		"pattern":            `{"bank":{"$id":{".pattern":"^[A-Z]+$"}}}`,
++		"metadata namespace": `{"bank":{".metadata":{".patern":{"default":"kept"}}}}`,
++		"rules":              `{"bank":{".rules":{}}}`,
++		"combined":           `{"bank":{".self":{},".metadata":{"currency":{"default":"USD"}},".rules":{},"$id":{".pattern":"^[0-9]+$"}}}`,
++	} {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			systemController, ledgerController := newTestingSystemController(t, true)
++			ledgerController.EXPECT().InsertSchema(gomock.Any(), gomock.Any()).Return(nil, nil, false, nil)
++			router := NewRouter(systemController, jwt.NewNoAuth(), "develop")
++			req := httptest.NewRequest(http.MethodPost, "/default/schemas/v1", bytes.NewBufferString(`{"chart":`+chart+`}`))
++			rec := httptest.NewRecorder()
++			router.ServeHTTP(rec, req)
++			require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
++		})
++	}
++}
++
++func TestStoredLegacyChartStillDecodes(t *testing.T) {
++	t.Parallel()
++	var schema ledger.Schema
++	err := json.Unmarshal([]byte(`{"version":"legacy","chart":{"bank":{".patern":"ignored historically"}}}`), &schema)
++	require.NoError(t, err, "read-side decoding must not be made strict by HTTP admission validation")
++	require.NotNil(t, schema.Chart["bank"].Account)
++	encoded, err := json.Marshal(schema)
++	require.NoError(t, err)
++	var roundTrip ledger.Schema
++	require.NoError(t, json.Unmarshal(encoded, &roundTrip))
++	require.NotNil(t, roundTrip.Chart["bank"].Account)
++}
+diff --git a/internal/api/v2/schema_chart_properties.go b/internal/api/v2/schema_chart_properties.go
+new file mode 100644
+index 0000000..8d233dc
+--- /dev/null
++++ b/internal/api/v2/schema_chart_properties.go
+@@ -0,0 +1,68 @@
++package v2
++
++import (
++	"encoding/json"
++	"fmt"
++	"sort"
++	"strings"
++
++	ledger "github.com/formancehq/ledger/internal"
++)
++
++// validateSchemaChartProperties is a write-boundary check, not a replacement
++// for ChartOfAccounts.UnmarshalJSON. Legacy schemas must remain readable.
++// Call it after the ordinary decoder has checked chart structure and values.
++func validateSchemaChartProperties(payload json.RawMessage) error {
++	var data struct {
++		Chart json.RawMessage `json:"chart"`
++	}
++	if err := json.Unmarshal(payload, &data); err != nil {
++		return err
++	}
++	if len(data.Chart) == 0 {
++		return nil
++	}
++	var chart map[string]json.RawMessage
++	if err := json.Unmarshal(data.Chart, &chart); err != nil {
++		return err
++	}
++	keys := make([]string, 0, len(chart))
++	for key := range chart {
++		keys = append(keys, key)
++	}
++	sort.Strings(keys)
++	for _, key := range keys {
++		if err := validateChartSegmentProperties(chart[key], key); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func validateChartSegmentProperties(raw json.RawMessage, path string) error {
++	var segment map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &segment); err != nil {
++		return err
++	}
++	keys := make([]string, 0, len(segment))
++	for key := range segment {
++		keys = append(keys, key)
++	}
++	sort.Strings(keys)
++	for _, key := range keys {
++		if strings.HasPrefix(key, ledger.PROPERTY_PREFIX) {
++			switch key {
++			case ledger.SELF_KEY, ledger.METADATA_KEY, ledger.RULES_KEY, ledger.PATTERN_KEY:
++				// Metadata and rules have their own namespaces; do not recurse
++				// into their arbitrary user keys as if they were chart segments.
++				continue
++			default:
++				return fmt.Errorf("unknown chart property %q at segment %q", key, path)
++			}
++		}
++		if err := validateChartSegmentProperties(segment[key], path+":"+key); err != nil {
++			return err
++		}
++	}
++	return nil
++}
