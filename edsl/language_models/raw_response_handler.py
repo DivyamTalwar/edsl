@@ -71,6 +71,31 @@ class RawResponseHandler:
         self.inference_service = inference_service
 
     def get_generated_token_string(self, raw_response):
+        # The configured Anthropic path addresses content[0].text. Reading that
+        # path first silently drops later text blocks when the first block is text.
+        # Normalize the whole typed content list before the generic fast path.
+        if self.inference_service == "anthropic":
+            response = raw_response
+            if isinstance(response, str):
+                try:
+                    response = json.loads(response)
+                except json.JSONDecodeError:
+                    response = None
+            if isinstance(response, dict) and isinstance(response.get("content"), list):
+                text_blocks = []
+                for block in response["content"]:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if not isinstance(text, str):
+                            raise LanguageModelBadResponseError(
+                                message="Anthropic text block has no valid text string.",
+                                response_json=response,
+                            )
+                        text_blocks.append(text)
+                # Match the existing fallback's block separator and the ordinary
+                # extractor's outer whitespace trimming. Never expose thinking or
+                # tool input as the answer, and leave raw response data untouched.
+                return "\n\n".join(text_blocks).strip()
         try:
             return _extract_item_from_raw_response(raw_response, self.key_sequence)
         except (
